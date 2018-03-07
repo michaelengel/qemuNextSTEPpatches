@@ -1,0 +1,289 @@
+diff -ruN qemu-0.8.0-distclean/Makefile.target qemu-0.8.0/Makefile.target
+--- qemu-0.8.0-distclean/Makefile.target        Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/Makefile.target  Sat Jul  4 10:29:43 2009
+@@ -308,7 +308,7 @@
+ # Hardware support
+ VL_OBJS+= ide.o ne2000.o pckbd.o ps2.o vga.o $(SOUND_HW) dma.o $(AUDIODRV)
+ VL_OBJS+= fdc.o mc146818rtc.o serial.o i8259.o i8254.o pc.o
+-VL_OBJS+= cirrus_vga.o mixeng.o apic.o parallel.o
++VL_OBJS+= cirrus_vga.o mixeng.o apic.o parallel.o busmouse.o
+ DEFINES += -DHAS_AUDIO
+ endif
+ ifeq ($(TARGET_BASE_ARCH), ppc)
+diff -ruN qemu-0.8.0-distclean/hw/busmouse.c qemu-0.8.0/hw/busmouse.c
+--- qemu-0.8.0-distclean/hw/busmouse.c  Wed Dec 31 19:00:00 1969
++++ qemu-0.8.0/hw/busmouse.c    Sat Jul  4 10:29:43 2009
+@@ -0,0 +1,160 @@
++/*
++ * QEMU Busmouse emulation
++ *
++ * Copyright (c) 2005 Michael Engel (engel-at-informatik.uni-marburg.de)
++ * using hints from parallel.c and ps2.c
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++#include "vl.h"
++
++/*
++ * These are the definitions for the busmouse controller registers
++ * and internal state
++ */
++
++struct BusmouseState {
++    uint8_t data;
++    uint8_t signature;
++    uint8_t control;
++    uint8_t interrupt;
++    uint8_t config;
++    uint8_t command;
++    int irq;
++    int irq_pending;
++    CharDriverState *chr;
++    int hw_driver;
++    uint16_t mouse_dx;
++    uint16_t mouse_dy;
++    uint16_t mouse_dz;
++    uint16_t mouse_buttons;
++};
++
++static void busmouse_update_irq(BusmouseState *s);
++
++static void busmouse_event(void *opaque,
++                            int dx, int dy, int dz, int buttons_state)
++{
++    BusmouseState *s = opaque;
++
++    s->mouse_dx += dx;
++    s->mouse_dy += dy;
++    s->mouse_dz += dz;
++    /* XXX: SDL sometimes generates nul events: we delete them */
++    if (s->mouse_dx == 0 && s->mouse_dy == 0 && s->mouse_dz == 0 &&
++        s->mouse_buttons == buttons_state)
++       return;
++    s->mouse_buttons = buttons_state;
++
++    s->irq_pending = 1;
++    busmouse_update_irq(s);
++}
++
++static void busmouse_update_irq(BusmouseState *s)
++{
++    if (s->irq_pending)
++        pic_set_irq(s->irq, 1);
++    else
++        pic_set_irq(s->irq, 0);
++}
++
++static void busmouse_ioport_write(void *opaque, uint32_t addr, uint32_t val)
++{
++    BusmouseState *s = opaque;
++
++    addr &= 0xf;
++    switch(addr) {
++    case 0xc: /* data port */
++        break;
++    case 0xd: /* signature port */
++        break;
++    case 0xe: /* control/interrupt port */
++        s->command = val;
++        break;
++    case 0xf: /* config port */
++        break;
++    }
++}
++
++static uint32_t busmouse_ioport_read(void *opaque, uint32_t addr)
++{
++    BusmouseState *s = opaque;
++    uint32_t ret = 0x00;
++    static int interrupt_val = 0x01;
++
++    addr &= 0xf;
++    switch(addr) {
++    case 0xc: /* data port */
++        s->irq_pending = 0;
++        switch (s->command) {
++        case 0x00: /* no op? */
++            break;
++        case 0x80: /* x low */
++            ret = s->mouse_dx & 0xf;
++            ret += (7 - s->mouse_buttons) << 5; /* button state */
++            break;
++        case 0xa0: /* x high */
++            ret = (s->mouse_dx >> 4) & 0xf;
++            s->mouse_dx = 0;
++            break;
++        case 0xc0: /* y low */
++            ret = s->mouse_dy & 0xf;
++            break;
++        case 0xe0: /* y high */
++            ret =  (s->mouse_dy >> 4) & 0xf;
++            s->mouse_dy = 0;
++            break;
++        }
++        busmouse_update_irq(s);
++        break;
++    case 0xd: /* signature port */
++        ret = 0xa5; /* return signature byte */
++        busmouse_update_irq(s);
++        break;
++    case 0xe: /* control/interrupt port */
++        ret = interrupt_val;
++        interrupt_val = (interrupt_val << 1) & 0xff;
++        if (interrupt_val == 0) interrupt_val = 1;
++
++        break;
++    case 0xf: /* config port */
++        break;
++    }
++    return ret;
++}
++
++/* If fd is zero, it means that the busmouse device uses the console */
++BusmouseState *busmouse_init(int base, int irq, CharDriverState *chr)
++{
++    BusmouseState *s;
++
++    s = qemu_mallocz(sizeof(BusmouseState));
++    if (!s)
++        return NULL;
++    s->chr = chr;
++    s->hw_driver = 0;
++    s->irq = irq;
++    s->data = 0;
++    s->mouse_buttons = 0x0;
++    register_ioport_write(base, 8, 1, busmouse_ioport_write, s);
++    register_ioport_read(base, 8, 1, busmouse_ioport_read, s);
++    qemu_add_mouse_event_handler(busmouse_event, s);
++
++    return s;
++}
+diff -ruN qemu-0.8.0-distclean/hw/cirrus_vga.c qemu-0.8.0/hw/cirrus_vga.c
+--- qemu-0.8.0-distclean/hw/cirrus_vga.c        Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/hw/cirrus_vga.c  Sat Jul  4 10:29:43 2009
+@@ -3082,7 +3082,7 @@
+     CirrusVGAState *s;
+     int device_id;
+
+-    device_id = CIRRUS_ID_CLGD5446;
++    device_id = CIRRUS_ID_CLGD5434;
+
+     /* setup PCI configuration registers */
+     d = (PCICirrusVGAState *)pci_register_device(bus, "Cirrus VGA",
+diff -ruN qemu-0.8.0-distclean/hw/dma.c qemu-0.8.0/hw/dma.c
+--- qemu-0.8.0-distclean/hw/dma.c       Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/hw/dma.c Sat Jul  4 10:30:08 2009
+@@ -198,7 +198,7 @@
+     switch (iport) {
+     case 0x08:                  /* command */
+         if ((data != 0) && (data & CMD_NOT_SUPPORTED)) {
+-            dolog ("command %#x not supported\n", data);
++            //dolog ("command %#x not supported\n", data);
+             return;
+         }
+         d->command = data;
+diff -ruN qemu-0.8.0-distclean/hw/i8259.c qemu-0.8.0/hw/i8259.c
+--- qemu-0.8.0-distclean/hw/i8259.c     Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/hw/i8259.c       Sat Jul  4 10:29:43 2009
+@@ -119,7 +119,8 @@
+        master, the IRQ coming from the slave is not taken into account
+        for the priority computation. */
+     mask = s->isr;
+-    if (s->special_fully_nested_mode && s == &s->pics_state->pics[0])
++//    if (s->special_fully_nested_mode && s == &s->pics_state->pics[0])
++    if (s == &s->pics_state->pics[0])
+         mask &= ~(1 << 2);
+     cur_priority = get_priority(s, mask);
+     if (priority < cur_priority) {
+diff -ruN qemu-0.8.0-distclean/hw/pc.c qemu-0.8.0/hw/pc.c
+--- qemu-0.8.0-distclean/hw/pc.c        Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/hw/pc.c  Sat Jul  4 10:29:44 2009
+@@ -574,6 +574,9 @@
+ static int parallel_io[MAX_PARALLEL_PORTS] = { 0x378, 0x278, 0x3bc };
+ static int parallel_irq[MAX_PARALLEL_PORTS] = { 7, 7, 7 };
+
++static int busmouse_io[MAX_BUSMOUSE_PORTS] = { 0x238 };
++static int busmouse_irq[MAX_BUSMOUSE_PORTS] = { 5 };
++
+ #ifdef HAS_AUDIO
+ static void audio_init (PCIBus *pci_bus)
+ {
+@@ -798,6 +801,10 @@
+         if (parallel_hds[i]) {
+             parallel_init(parallel_io[i], parallel_irq[i], parallel_hds[i]);
+         }
++    }
++
++    for(i = 0; i < 1; i++) {
++        busmouse_init(busmouse_io[i], busmouse_irq[i], 0);
+     }
+
+     if (pci_enabled) {
+diff -ruN qemu-0.8.0-distclean/hw/ps2.c qemu-0.8.0/hw/ps2.c
+--- qemu-0.8.0-distclean/hw/ps2.c       Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/hw/ps2.c Sat Jul  4 10:29:44 2009
+@@ -506,7 +506,9 @@
+     s->common.update_arg = update_arg;
+     ps2_reset(&s->common);
+     register_savevm("ps2mouse", 0, 1, ps2_mouse_save, ps2_mouse_load, s);
+-    qemu_add_mouse_event_handler(ps2_mouse_event, s);
++
++    /* disabled for busmouse emulation (req'd for running OpenStep) */
++    /* qemu_add_mouse_event_handler(ps2_mouse_event, s); */
+     qemu_register_reset(ps2_reset, &s->common);
+     return s;
+ }
+diff -ruN qemu-0.8.0-distclean/hw/sb16.c qemu-0.8.0/hw/sb16.c
+--- qemu-0.8.0-distclean/hw/sb16.c      Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/hw/sb16.c        Sat Jul  4 10:29:44 2009
+@@ -50,7 +50,7 @@
+     int dma;
+     int hdma;
+     int port;
+-} conf = {5, 4, 5, 1, 5, 0x220};
++} conf = {5, 4, 7, 1, 5, 0x220};
+
+ typedef struct SB16State {
+     QEMUSoundCard card;
+diff -ruN qemu-0.8.0-distclean/vl.h qemu-0.8.0/vl.h
+--- qemu-0.8.0-distclean/vl.h   Mon Dec 19 17:51:53 2005
++++ qemu-0.8.0/vl.h     Sat Jul  4 10:29:44 2009
+@@ -271,6 +271,10 @@
+
+ #define MAX_PARALLEL_PORTS 3
+
++/* busmouse ports */
++
++#define MAX_BUSMOUSE_PORTS 1
++
+ extern CharDriverState *parallel_hds[MAX_PARALLEL_PORTS];
+
+ /* VLANs support */
+@@ -754,6 +758,11 @@
+
+ typedef struct ParallelState ParallelState;
+ ParallelState *parallel_init(int base, int irq, CharDriverState *chr);
++
++/* busmouse.c */
++
++typedef struct BusmouseState BusmouseState;
++BusmouseState *busmouse_init(int base, int irq, CharDriverState *chr);
+
+ /* i8259.c */
+
